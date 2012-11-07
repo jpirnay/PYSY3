@@ -99,7 +99,8 @@ struct Telemetry
    long           last_time_fix;
    long           last_position_fix;
   // Geiger 
-   long           geigerticks;
+   unsigned long  geigerticks;
+   unsigned long  startticks;
   // Temperatur 
    double         temperature_int;
    double         temperature_ext;
@@ -107,7 +108,8 @@ struct Telemetry
    long           pascal;
    long           pascal_raw;
 };
-Telemetry TelemetryData, TelemetryTx;
+volatile Telemetry TelemetryData;
+volatile Telemetry TelemetryTx;
 
 // Communication with SD card reader
 SdFat sd;
@@ -116,13 +118,32 @@ SdFile gpsfile;
 
 void CopyTelemetry()
 {
- TelemetryTx = TelemetryData;
+ TelemetryTx.counter = TelemetryData.counter;
+ TelemetryTx.date = TelemetryData.date;
+ TelemetryTx.time = TelemetryData.time;
+ TelemetryTx.latitude = TelemetryData.latitude;
+ TelemetryTx.altitude = TelemetryData.altitude;
+ TelemetryTx.speed_horiz = TelemetryData.speed_horiz;
+ TelemetryTx.speed_vert = TelemetryData.speed_vert;
+ TelemetryTx.satellites = TelemetryData.satellites;
+ TelemetryTx.last_time_fix = TelemetryData.last_time_fix;
+ TelemetryTx.last_position_fix = TelemetryData.last_position_fix;
+ TelemetryTx.geigerticks = TelemetryData.geigerticks;
+ TelemetryTx.startticks = TelemetryData.startticks;
+ TelemetryTx.temperature_int = TelemetryData.temperature_int;
+ TelemetryTx.temperature_ext = TelemetryData.temperature_ext;
+ TelemetryTx.pascal = TelemetryData.pascal;
+ TelemetryTx.pascal_raw = TelemetryData.pascal_raw;
+
+// won't work
+// TelemetryTx = TelemetryData;
  ResetTelemetry(); 
 }  
 
 void ResetTelemetry()
 {
-  memset(&TelemetryData, 0, sizeof(TelemetryData));
+  memset((void *)&TelemetryData, 0, sizeof(TelemetryData));
+  TelemetryData.startticks = millis();
   // TelemetryData = {};
 }  
 
@@ -181,18 +202,18 @@ uint16_t gps_CRC16_checksum (char *string)
 //// Setup and Main Loop  
 void setup()
 {
-  Serial.begin(9600);
-
+//  Serial.begin(9600);
   GPSModul.begin(9600);
+
   ResetTelemetry();
     
   initCard();                           // init the SD card
-  initTime();							// read time from SD card 
+  initTime();				// read time from SD card 
   initLog();                            // prepare log files
-  bmp_begin();
+  bmp_begin();                          // prepare BMP085 sensor
   
-  setupRadio();
-  initialise_interrupt();
+  setupRadio();                         // setup RFM22 radio module
+  initialise_interrupt();               // allow Timer Interrupts for transmission as well as 
 //  Serial.print("Avail Ram: ");
 //  Serial.println(AvailRam());
 }
@@ -248,7 +269,7 @@ boolean res;
   }
   return res;
 }
-//// INTERRUPT ROUTINES FOR RADIO GO HERE
+//// INTERRUPT ROUTINES FOR RADIO AND GEIGER COUNTER GO HERE
 void initialise_interrupt()
 {
   // initialize Timer1
@@ -262,7 +283,14 @@ void initialise_interrupt()
   TCCR1B |= (1 << CS12);
   // enable timer compare interrupt:
   TIMSK1 |= (1 << OCIE1A);
+
+  attachInterrupt(0,GetEvent,FALLING);  // Geiger event on D2 triggers interrupt
+
   sei();          // enable global interrupts
+}
+
+void GetEvent(){   // ISR triggered for each new event (count)
+  TelemetryData.geigerticks++;
 }
 
 
