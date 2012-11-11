@@ -32,11 +32,17 @@
 #define BUZZER_PIN       16             // sw jumper for buzzer
 #define LED_PIN          14             // L1 LED on Logger Shield
 
+////// DEFINES FOR logging periods
+#define FREQ_LOG_SD    5000  // every 5 seconds write data to file
+#define FREQ_LOG_RADIO 10000 // every 10 seconds transmit data over radio
+// #define PRI_RATIO       175             // defaults to SBM-20 ratio
+#define PRI_RATIO       122             // defaults to SI-29BG ratio
+
 ////// DEFINES FOR RADIO
 #define ASCII 7          // ASCII 7 or 8
 #define STOPBITS 2       // Either 1 or 2
 #define TXDELAY 0        // Delay between sentence TX's
-#define RTTY_BAUD 50    // Baud rate for use with RFM22B Max = 600
+#define RTTY_BAUD 100    // Baud rate for use with RFM22B Max = 600
 #define REVERSE false  
 
 #define COMPUTEFREQ false // if false take parameter from previous calc, saves some bytes
@@ -69,6 +75,7 @@ bool _gps_data_good;
 #define RADIO_MAXTRANSMIT_LEN 80
 char datastring[RADIO_MAXTRANSMIT_LEN];
 char txstring[RADIO_MAXTRANSMIT_LEN];
+char dummy[12], timestr[12];
 volatile int txstatus=1;
 volatile int txstringlength=0;
 volatile char txc;
@@ -78,12 +85,13 @@ bool InterruptAllowed = true;
 
 /// COMMON VARIABLES
 boolean SD_OK = true;                   // assume SD is OK until init
-char timeString[10];                    // time format determined by #defines above
-char dateString[10];                    // time format determined by #defines above
-byte day_of_week,DST;                   // if daylight savings time, DST == true
-int GMT_Offset;                         // defaults to 13 = GMT+1
 unsigned long counter;                  // counter for logcount
 boolean lowVcc = false;                 // true when Vcc < LOW_VCC
+
+unsigned long msec;
+
+unsigned long last_log_SD = 0;
+unsigned long last_log_Radio = 0;
 
 struct Telemetry
 {
@@ -108,7 +116,7 @@ struct Telemetry
    long           pascal;
    long           pascal_raw;
 };
-volatile Telemetry TelemetryData;
+Telemetry TelemetryData;
 volatile Telemetry TelemetryTx;
 
 // Communication with SD card reader
@@ -129,23 +137,27 @@ void CopyTelemetry()
  TelemetryTx.last_time_fix = TelemetryData.last_time_fix;
  TelemetryTx.last_position_fix = TelemetryData.last_position_fix;
  TelemetryTx.geigerticks = TelemetryData.geigerticks;
- TelemetryTx.startticks = TelemetryData.startticks;
+ TelemetryTx.startticks = millis() - TelemetryData.startticks; // logging period in msec
  TelemetryTx.temperature_int = TelemetryData.temperature_int;
  TelemetryTx.temperature_ext = TelemetryData.temperature_ext;
  TelemetryTx.pascal = TelemetryData.pascal;
  TelemetryTx.pascal_raw = TelemetryData.pascal_raw;
-
-// won't work
-// TelemetryTx = TelemetryData;
- ResetTelemetry(); 
 }  
 
 void ResetTelemetry()
 {
-  memset((void *)&TelemetryData, 0, sizeof(TelemetryData));
   TelemetryData.startticks = millis();
+  TelemetryData.geigerticks = 0;
   // TelemetryData = {};
 }  
+
+void FillTelemetry()
+{
+  TelemetryData.temperature_int = bmp_readTemperature();
+  TelemetryData.pascal = bmp_readPressure();
+  TelemetryData.pascal_raw = bmp_readRawPressure();  
+  TelemetryData.counter++;
+}
 
 /// SOME UTILITY FUNCTIONS
 int AvailRam(){ 
@@ -158,7 +170,7 @@ int AvailRam(){
 
 void addLong(long valu)
 {
-   char dummy[12];
+   emptyDummy();
    strcat(datastring, ",");
    ltoa(valu, dummy, 10);
    strcat(datastring, dummy);
@@ -166,7 +178,7 @@ void addLong(long valu)
 
 void addUInt(unsigned int valu)
 {
-   char dummy[12];
+   emptyDummy();
    strcat(datastring, ",");
    itoa(valu, dummy, 10);
    strcat(datastring, dummy);
@@ -174,12 +186,11 @@ void addUInt(unsigned int valu)
 
 void addDouble(double valu, int postfix)
 {
-   char dummy[12];
+   emptyDummy();
    strcat(datastring, ",");
    dtostrf(valu, postfix+2, postfix, dummy);
    strcat(datastring, dummy);
 }  
-
  
 uint16_t gps_CRC16_checksum (char *string)
 {
@@ -202,55 +213,133 @@ uint16_t gps_CRC16_checksum (char *string)
 //// Setup and Main Loop  
 void setup()
 {
-//  Serial.begin(9600);
-  GPSModul.begin(9600);
+  Serial.begin(9600);
+  Serial.print("Ram 1: ");
+  Serial.println(AvailRam());
 
+  GPSModul.begin(9600);
+  Serial.println("reset");
   ResetTelemetry();
-    
+  Serial.println("card");
   initCard();                           // init the SD card
+  Serial.println("time");
   initTime();				// read time from SD card 
+  Serial.println("log");
   initLog();                            // prepare log files
+  Serial.println("bmp");
   bmp_begin();                          // prepare BMP085 sensor
+  Serial.print("Ram 2: ");
+  Serial.println(AvailRam());
   
   setupRadio();                         // setup RFM22 radio module
   initialise_interrupt();               // allow Timer Interrupts for transmission as well as 
-//  Serial.print("Avail Ram: ");
-//  Serial.println(AvailRam());
 }
+
+void emptyDummy()
+{
+  for (byte i=0; i<sizeof(dummy); i++) dummy[i] = '\0';
+}
+
+void AppendToString (int iValue, char *pString){ // appends a byte to string passed
+  emptyDummy();
+  itoa(iValue,dummy,10);
+  strcat(pString,dummy);
+}
+
+void FormatTime(){  // get the time and date from the GPS and format it
+  int hr, mi, se;
+  hr = (int) TelemetryTx.time / 1000000;
+  mi = (int) (TelemetryTx.time / 10000) % 100;
+  se = (int) (TelemetryTx.time / 100) % 100;
+  Serial.println("FT: ");
+  Serial.println(hr);
+  Serial.println(mi);
+  Serial.println(se);
   
+  timestr[0]='\0';
+  AppendToString (hr, timestr);         // add 24 hour time to string
+  strcat(timestr, ":");
+  if (mi < 10) strcat(timestr,"0");
+  AppendToString (mi,timestr);       // add MINUTES to string
+  strcat(timestr,":");
+  if (se < 10) strcat(timestr,"0");
+  AppendToString (se,timestr);     // add SECONDS to string
+  Serial.println(timestr);
+}
+
+void HAppendToString (int iValue, char *pString){ // appends a hex to string passed
+  emptyDummy();//  if (iValue<0x100) strcat(pString, "0");
+  if (iValue<0x10) strcat(pString, "0");
+  itoa(iValue, dummy, 16);
+  strcat(pString,dummy);
+}
+
+void logString() // just basic data
+{
+   int mylen;
+   uint16_t crc;
+   double logCPM, uSv;
+   long msc;
+   InterruptAllowed = false;
+   datastring[0];
+   strcat(datastring, "$$PYSY3");
+   addLong(TelemetryTx.counter);
+   FormatTime();
+   strcat(datastring, ",");
+   strcat(datastring, timestr);
+   addDouble(TelemetryTx.latitude / 100000.0, 5);
+   addDouble(TelemetryTx.longitude / 100000.0, 5);
+   addDouble(TelemetryTx.altitude / 100.0, 1);
+   addDouble(TelemetryTx.temperature_int, 1);
+   addDouble(TelemetryTx.temperature_ext, 1);
+   addDouble(TelemetryTx.speed_vert, 1);
+// store length of data as we will be truncating the string to this length later   
+   mylen = strlen(datastring);
+   addDouble(TelemetryTx.speed_horiz, 2);
+   addLong(TelemetryTx.pascal);
+   addLong(TelemetryTx.pascal_raw);
+   addLong(TelemetryTx.geigerticks);
+   logCPM = float(TelemetryTx.geigerticks) / (float(TelemetryTx.startticks) / 60000);
+   uSv = logCPM / PRI_RATIO;         // make uSV conversion
+   addDouble(logCPM, 2);
+   addDouble(uSv, 4);
+   
+  /// FILELOGGING
+  Serial.println(datastring);
+  Serial.println(strlen(datastring));
+  
+  logfile.println(datastring);
+  logfile.sync();
+// reset string to basic data and add checksum so radio interrupt can pick up a valid string at any time
+   datastring[mylen] = 0;
+   crc = gps_CRC16_checksum(datastring);
+   strcat(datastring, "*");
+   HAppendToString(crc, datastring);
+   strcat(datastring, "\x0d");   
+   Serial.println(datastring);
+   Serial.println(strlen(datastring));
+   InterruptAllowed = true;
+}
+
+
 void loop()
 {
-  long bmp_pascal;
-  double bmp_Temp;
+  msec = millis();
   readGPS();
-/// GET TELEMETRY DATA
-/*
-  Serial.print("Pascal=");
-  Serial.println(bmp_pascal);
-  Serial.print("Raw Pascal=");
-  Serial.println(bmp_raw_pascal);
-*/  
-/// CREATE STRING FOR TRANSMISSION
-  datastring[0]=0;
-  strcat(datastring, "$$PYSY3");
-/// COUNTER AND RAM
-  TelemetryData.counter = counter;
-  TelemetryData.pascal = bmp_readPressure();
-  TelemetryData.pascal_raw = bmp_readRawPressure();
+  if (msec - last_log_SD >= FREQ_LOG_SD)
+  {
+    FillTelemetry();   // get additional data, GPS and geigerticks are propagated in the background...
+    CopyTelemetry();   // copy telemetry data to transfer buffer
 
-/// ADD CHECKSUM
-  unsigned int CHECKSUM = gps_CRC16_checksum(datastring);  // Calculates the checksum for this datastring
-  char checksum_str[6];
-  sprintf(checksum_str, "*%04X\n", CHECKSUM);
-  strcat(datastring,checksum_str);
-/// THATS IT FOR TRANSMISSION, NOW ADD SOME ADDITIONAL DETAILS FOR SD CARD WRITING
-/// Now we do write our data on the SD card, let's make sure no one is interferring on the SPI bus during that time, 
-/// this may hurt the timing somewhat, but lets assume the writing is quick enough...
-  InterruptAllowed = false;
-  /// FILELOGGING
-  InterruptAllowed = true;
-  delay(1000);
-  counter++;
+    logString();
+    ResetTelemetry();
+    last_log_SD = msec;
+  }  
+  if (msec - last_log_Radio >= FREQ_LOG_RADIO)
+  {
+//    logRadio();
+    last_log_Radio = msec;
+  }  
 }
 
 //// GPScode
@@ -362,70 +451,25 @@ ISR(TIMER1_COMPA_vect)
   }
 }
 
-void FormatDateTime(){  // get the time and date from the GPS and format it
-  int dispYear;
-  int i;
-  memset(timeString,0,sizeof(timeString));  // initialize the strings
-  memset(dateString,0,sizeof(dateString));
-
-  // convert Sun=1 format to Sun=7 format (DST calc is based on this)
-  day_of_week = (weekday()==1) ? 7: (weekday() - 1);
-
-  // (The time lib will deal with AM/PM and 12 hour clock)
-  // make time string
-  AppendToString (hour(),timeString);         // add 24 hour time to string
-  strcat(timeString,":");
-  if (minute() < 10) strcat(timeString,"0");
-  AppendToString (minute(),timeString);       // add MINUTES to string
-  strcat(timeString,":");
-  if (second() < 10) strcat(timeString,"0");
-  AppendToString (second(),timeString);     // add SECONDS to string
-
-  // make date string
-  i=day();                              // add DAY to string
-  if (i < 10) strcat(dateString,"0");
-  AppendToString (i,dateString);  
-  strcat(dateString, ".");
-
-  i = month();                          // add MONTH to string  
-  if (i < 10) strcat(dateString,"0");
-  AppendToString (i,dateString);
-  strcat(dateString, ".");
-
-  i = year();                          // add YEAR to string
-  AppendToString (i,dateString);                            
-}
-
-
-void AppendToString (int iValue, char *pString){ // appends a byte to string passed
-  char tempStr[6];
-  memset(tempStr,'\0',sizeof(tempStr));
-  itoa(iValue,tempStr,10);
-  strcat(pString,tempStr);
-}
-
 
 void initCard(){   // initialize the SD card
   SD_OK = false;                        // don't try to write to the SD card
   pinMode(10, OUTPUT);                  // must set DEFAULT CS pin output, even if not used
-
   if (!sd.begin(10, SPI_HALF_SPEED))
  {  
-    sd.initErrorHalt();
     error("Card");
+    sd.initErrorHalt();
   }
   SD_OK = true;
 //  SdFile::dateTimeCallback(SDdateTime); 
-  SdFile::dateTimeCallback(SDDateTime);
 }
 
 void initLog(){
   char filename[]="py000.csv";
   if ( gpsfile.open("pysy.log", O_WRONLY | O_CREAT) ) {
     gpsfile.println("PYSY-Startup");
-    FormatDateTime();
-    gpsfile.println(dateString);
-    gpsfile.println(timeString);
+    FormatTime();
+    gpsfile.println(timestr);
     gpsfile.print("RAM:");
     gpsfile.println(AvailRam());
     gpsfile.sync();
@@ -439,18 +483,18 @@ void initLog(){
     filename[2] = i/100 + '0';
     filename[3] = (i%100)/10 + '0';
     filename[4] = i%10 + '0';
-/*    
+/*  */
     Serial.print("Trying: ");
     Serial.println(filename);
-*/
+/* */
     if (! sd.exists(filename)) {
         break;  // leave the loop!
     }  
   }
-//  Serial.print("Final test:"); Serial.println(filename);
+  Serial.print("Final test:"); Serial.println(filename);
   if (logfile.open(filename, O_WRONLY | O_CREAT) ) {
-//    Serial.println(F("SD OK, now write..."));
-    logfile.println(F("NR,DATE,TIME,LAT,LON,KMPH,ALT,FIX,SATS,CPM,uSv,Vcc,TEMP,PR1,PR2"));
+    Serial.println("SD OK, now write...");
+    logfile.println("NR,TIME,LAT,LON,ALT,FIX,SATS,CPM,uSv,Vcc,TEMP,PR1,PR2");
   }
   else
   {
@@ -474,43 +518,55 @@ void initTime()
   int tpos[6];
   int valu, ct, rd;
   tpos[6]=2012; // YEAR
-  tpos[5]=10;   // MONTH
-  tpos[4]=20;   // DAY
+  tpos[5]=11;   // MONTH
+  tpos[4]=17;   // DAY
   tpos[3]=0;    // SEC
   tpos[2]=0;    // MIN
   tpos[1]=14;   // HOUR
+#if false  
+  Serial.println("Time variables set...");
   if (SD_OK)
   {
     ct = 1;
     valu = 0;
-    if (logfile.open("time.txt", O_READ))
+    if (sd.exists("time.txt"))
     {
-       while ((rd = logfile.read()) >= 0){
-         ch = (char)rd;
-         switch (ch) {
-         case '\n':
-           if (ct<=6) tpos[ct] = valu;
-           ct = ct + 1;
-           valu = 0;
-           break;
-         case '0': valu = valu * 10 + 0; break;
-         case '1': valu = valu * 10 + 1; break;
-         case '2': valu = valu * 10 + 2; break;
-         case '3': valu = valu * 10 + 3; break;
-         case '4': valu = valu * 10 + 4; break;
-         case '5': valu = valu * 10 + 5; break;
-         case '6': valu = valu * 10 + 6; break;
-         case '7': valu = valu * 10 + 7; break;
-         case '8': valu = valu * 10 + 8; break;
-         case '9': valu = valu * 10 + 9; break;
-         default:
-           break;  
-         }  
-       } 
-      logfile.close(); 
+      if (logfile.open("time.txt", O_READ))
+      {
+         Serial.println("Time open okay");
+         while ((rd = logfile.read()) >= 0){
+           ch = (char)rd;
+           Serial.print(ch);
+           switch (ch) {
+           case '\n':
+             if (ct<=6) tpos[ct] = valu;
+             ct = ct + 1;
+             valu = 0;
+             break;
+           case '0': valu = valu * 10 + 0; break;
+           case '1': valu = valu * 10 + 1; break;
+           case '2': valu = valu * 10 + 2; break;
+           case '3': valu = valu * 10 + 3; break;
+           case '4': valu = valu * 10 + 4; break;
+           case '5': valu = valu * 10 + 5; break;
+           case '6': valu = valu * 10 + 6; break;
+           case '7': valu = valu * 10 + 7; break;
+           case '8': valu = valu * 10 + 8; break;
+           case '9': valu = valu * 10 + 9; break;
+           default:
+             break;  
+           }  
+         } 
+        Serial.println(); 
+        logfile.close(); 
+      }
+      else 
+        Serial.println("Could not open time.txt"); 
     }
+    else
+      Serial.println("No time file");
   }
-/*
+/**/
   Serial.print("Set Time:");
   for (ct=1;ct<4;ct++){
      Serial.print(tpos[ct]); 
@@ -522,7 +578,8 @@ void initTime()
      Serial.print(".");
   }  
   Serial.println();
-*/
+/**/
+#endif
   setTime(tpos[1], tpos[2], tpos[3], tpos[4], tpos[5], tpos[6]);
 }
 
@@ -562,35 +619,10 @@ time_t gpsTimeToArduinoTime(){  // returns time_t from GPS with GMT_Offset for h
   GPS_crack_datetime(&year, &tm.Month, &tm.Day, &tm.Hour, &tm.Minute, &tm.Second, NULL, NULL);
   tm.Year = year - 1970; 
   time_t time = makeTime(tm);
-  if (InDST()) time = time + SECS_PER_HOUR;
-  return time + (GMT_Offset * SECS_PER_HOUR);
+//  if (InDST()) time = time + SECS_PER_HOUR;
+  return time;
+ // + (GMT_Offset * SECS_PER_HOUR);
 }
 
 
-bool InDST(){  // Returns true if in DST - Caution: works for central europe only
-  // DST starts the last Sunday in March and ends the last Sunday in Octobre
-  bool res;
-  byte DOWinDST, nextSun;
-  int Dy, Mn;  
-
-  Dy = tmDay;
-  Mn = tmMonth;
-  //Dy = 27;  // FOR TESTING
-  //Mn = 7;
-  res = false;
-
-  // Pre-qualify for in DST in the widest range (any date between  and 23.10) 
-  // Earliest date in March is 25th
-  // Earliest date in October is 25th
-  if ((Mn == 3 && Dy >= 25) || (Mn > 3 && Mn < 10) || (Mn == 10 && Dy <= 23) ){
-    DOWinDST = true;                    // assume it's in DST until proven otherwise
-    nextSun = Dy + (7 - day_of_week);   // find the date of the last Sunday
-  while (nextSun<24) nextSun += 7;
-    if (nextSun > 31) nextSun -= 7;     // come back to month
-    if (Mn == 3 && (Dy < nextSun)) DOWinDST = false;     // it's before the last Sun in March
-    if (Mn == 10 && (Dy >= nextSun)) DOWinDST = false; // it's after the 1ast Sun in Oct.
-    if (DOWinDST) res = true;           // DOW is still OK so it's in DST
-  }
-  return res;                         // Nope, not in DST
-}
 
